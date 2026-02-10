@@ -1,10 +1,12 @@
 import qupath.lib.roi.ROIs
 import qupath.lib.objects.PathObjects
 import qupath.lib.regions.ImagePlane
+import qupath.lib.images.servers.*
+import qupath.lib.roi.interfaces.*
 
 // Parameters - adjust these as needed
 def numSquares = 10           // Number of random squares to generate
-def squareSizeUM = 100       // Size of each square (in micrometers/um)
+def squareSizeUM = 1000       // Size of each square (in micrometers/um)
 def minDistanceUM = 50        // Minimum distance between squares (in um, optional)
 
 // Get the current image data
@@ -14,86 +16,116 @@ def server = imageData.getServer()
 // Get pixel calibration
 def cal = server.getPixelCalibration()
 def pixelWidth = cal.getPixelWidthMicrons()
-def pixelHeight = cal.getPixelHeightMicrons()
-
-// Check if calibration is available
-if (!cal.hasPixelSizeMicrons()) {
-    println "Warning: No pixel calibration found. Using pixels instead of micrometers."
-    pixelWidth = 1.0
-    pixelHeight = 1.0
-}
 
 // Convert um to pixels
 def squareSize = Math.round(squareSizeUM / pixelWidth) as int
 def minDistance = Math.round(minDistanceUM / pixelWidth) as int
 
-println "Square size: ${squareSizeUM} um = ${squareSize} pixels"
-println "Pixel size: ${pixelWidth} x ${pixelHeight} um"
-
 // Get image dimensions
 def width = server.getWidth()
 def height = server.getHeight()
 
+// --- TISSUE SELECTION LOGIC ---
+// This looks for ALL existing annotations in your hierarchy
+def annotations = imageData.getHierarchy().getAnnotationObjects()
+
+if (annotations.isEmpty()) {
+    println "No annotations found! Please draw or detect a tissue area first."
+    return
+}
+
+def tissueROIs = annotations.collect { it.getROI() }
+println "Found ${tissueROIs.size()} annotated regions to use as boundaries."
+
 // Create a random number generator
 def random = new Random()
-
-// Store created squares to check for overlaps (if needed)
 def squares = []
+def attempts = 0
+def maxAttempts = numSquares * 5000
+def createdSquares = 0
 
-// Generate random squares
-for (int i = 0; i < numSquares; i++) {
-    def validLocation = false
-    def x, y
-    def attempts = 0
-    def maxAttempts = 1000
+while (createdSquares < numSquares && attempts < maxAttempts) {
+    // Pick one of the annotated regions at random
+    def targetROI = tissueROIs.get(random.nextInt(tissueROIs.size()))
     
-    // Try to find a valid location
-    while (!validLocation && attempts < maxAttempts) {
-        // Generate random coordinates
-        x = random.nextInt(width - squareSize)
-        y = random.nextInt(height - squareSize)
+    // Get bounds of the specific annotation
+    def bX = targetROI.getBoundsX()
+    def bY = targetROI.getBoundsY()
+    def bW = targetROI.getBoundsWidth()
+    def bH = targetROI.getBoundsHeight()
+    
+    // Skip if the annotation is smaller than the square we want to create
+    if (bW < squareSize || bH < squareSize) {
+        attempts++
+        continue
+    }
+
+    // Generate random coordinates within the bounding box of that annotation
+    def x = bX + random.nextDouble() * (bW - squareSize)
+    def y = bY + random.nextDouble() * (bH - squareSize)
+    
+    // Create the candidate square ROI
+    def roi = ROIs.createRectangleROI(x, y, squareSize, squareSize, ImagePlane.getDefaultPlane())
+    
+    // Check if the square is FULLY contained within the annotated area
+    if (isFullyContained(roi, targetROI)) {
         
-        // Check if square is within bounds
-        if (x >= 0 && y >= 0 && x + squareSize <= width && y + squareSize <= height) {
-            validLocation = true
-            
-            // Optional: Check minimum distance from other squares
-            if (minDistance > 0) {
-                for (square in squares) {
-                    def dx = Math.abs(square[0] - x)
-                    def dy = Math.abs(square[1] - y)
-                    if (dx < squareSize + minDistance && dy < squareSize + minDistance) {
-                        validLocation = false
-                        break
-                    }
+        // Check minimum distance from other squares already created
+        def validLocation = true
+        if (minDistance > 0) {
+            for (square in squares) {
+                def dx = Math.abs(square[0] - x)
+                def dy = Math.abs(square[1] - y)
+                if (dx < squareSize + minDistance && dy < squareSize + minDistance) {
+                    validLocation = false
+                    break
                 }
             }
         }
-        attempts++
+        
+        if (validLocation) {
+            def annotation = PathObjects.createAnnotationObject(roi)
+            annotation.setName("Random_Square_${createdSquares + 1}")
+            
+            // Add to hierarchy
+            imageData.getHierarchy().addObject(annotation)
+            squares.add([x, y])
+            createdSquares++
+            println "Created square ${createdSquares} at (${(int)x}, ${(int)y})"
+        }
     }
-    
-    if (validLocation) {
-        // Create square ROI
-        def roi = ROIs.createRectangleROI(x, y, squareSize, squareSize, ImagePlane.getDefaultPlane())
-        
-        // Create annotation with name
-        def annotation = PathObjects.createAnnotationObject(roi)
-        annotation.setName("R${i + 1}")  // Set name as R1, R2, R3, etc.
-        
-        // Add to hierarchy
-        imageData.getHierarchy().addObject(annotation)
-        
-        // Store coordinates
-        squares.add([x, y])
-        
-        println "Created annotation R${i + 1} at position (${x}, ${y})"
-    } else {
-        println "Could not find valid location for square R${i + 1} after ${maxAttempts} attempts"
-    }
+    attempts++
 }
 
-// Resolve hierarchy and update display
+// Finalize
 imageData.getHierarchy().resolveHierarchy()
 fireHierarchyUpdate()
 
-println "Successfully created ${squares.size()} random square annotations (${squareSizeUM} um each)"
+println "Done! Created ${createdSquares} squares inside your annotated areas."
+
+/**
+ * Checks if the candidate square is fully inside the target tissue annotation.
+ * It checks the 4 corners and the center.
+ */
+def isFullyContained(squareROI, tissueROI) {
+    double x = squareROI.getBoundsX()
+    double y = squareROI.getBoundsY()
+    double w = squareROI.getBoundsWidth()
+    double h = squareROI.getBoundsHeight()
+    
+    // Define points to check (Corners + Center)
+    def points = [
+        [x, y], 
+        [x + w, y], 
+        [x, y + h], 
+        [x + w, y + h], 
+        [x + w/2, y + h/2]
+    ]
+    
+    for (p in points) {
+        if (!tissueROI.contains(p[0], p[1])) {
+            return false
+        }
+    }
+    return true
+}
